@@ -254,16 +254,36 @@
   };
 
   // 生成短 ID，格式如 M006、SET005、k_abc123
+  // 知识 ID 单调计数器：即便在同一毫秒内连续生成也不会重复
+  var knowledgeIdSeq = 0;
+
+  /**
+   * 生成一个保证不与 existingList 中任何 id 冲突的知识 ID
+   * 同一毫秒内的连续调用通过自增序号区分，极端碰撞时再重试
+   */
+  function nextKnowledgeId(existingList) {
+    var used = {};
+    (existingList || []).forEach(function (item) {
+      if (item && item.id) used[item.id] = true;
+    });
+    var id;
+    do {
+      knowledgeIdSeq += 1;
+      id = 'k_' + Date.now().toString(36) + '_' + knowledgeIdSeq.toString(36);
+    } while (used[id]);
+    return id;
+  }
+
   function nextId(prefix, existingList) {
-    // 知识条目使用短时间戳
+    // 知识条目使用「时间戳 + 单调序号」，批量生成时编号各自独立
     if (prefix === 'k') {
-      return 'k_' + Date.now().toString(36);
+      return nextKnowledgeId(existingList);
     }
-    
+
     // 其他类型使用递增编号
     var maxNum = 0;
     var list = existingList || [];
-    
+
     // 找出当前最大编号
     list.forEach(function (item) {
       if (item.id) {
@@ -277,12 +297,58 @@
         }
       }
     });
-    
+
     // 生成下一个编号，补零到3位
     var nextNum = maxNum + 1;
     var padded = ('000' + nextNum).slice(-3);
     return prefix + padded;
   }
+
+  /**
+   * 修复历史数据：保证一组知识中每条都有独立编号。
+   * 对缺失编号或与本组内其它条目重复的编号，按顺序重新生成。
+   * 返回 { list: 修复后的列表, changed: 是否发生改动 }
+   */
+  function repairKnowledgeIds(list) {
+    var seen = {};
+    var changed = false;
+    var repaired = (list || []).map(function (item) {
+      var k = Object.assign({}, item);
+      if (!k.id || seen[k.id]) {
+        var candidate;
+        do {
+          candidate = nextKnowledgeId(null);
+        } while (seen[candidate]);
+        k.id = candidate;
+        changed = true;
+      }
+      seen[k.id] = true;
+      return k;
+    });
+    return { list: repaired, changed: changed };
+  }
+
+  // 修复「容器 -> 知识列表」类存储（商家知识 / 商家集合知识 / 行业知识）
+  function repairKnowledgeMap(key, fallback) {
+    var all = load(key, fallback);
+    if (!all || typeof all !== 'object') return;
+    var changed = false;
+    Object.keys(all).forEach(function (ownerId) {
+      var result = repairKnowledgeIds(all[ownerId]);
+      all[ownerId] = result.list;
+      if (result.changed) changed = true;
+    });
+    if (changed) save(key, all);
+  }
+
+  // 启动时修复已持久化的重复/缺失编号，保证重新打开列表后编号唯一且稳定
+  (function repairStoredKnowledgeIds() {
+    repairKnowledgeMap('merchantKnowledge', defaultMerchantKnowledge);
+    repairKnowledgeMap('merchantSetKnowledge', defaultMerchantSetKnowledge);
+    repairKnowledgeMap('industryKnowledge', defaultIndustryKnowledge);
+    var globalResult = repairKnowledgeIds(load('globalKnowledge', defaultGlobalKnowledge));
+    if (globalResult.changed) save('globalKnowledge', globalResult.list);
+  })();
 
   var store = {
     getMerchants: function () {
@@ -330,7 +396,7 @@
     },
     addMerchantKnowledge: function (merchantId, item) {
       var list = store.getMerchantKnowledge(merchantId).slice();
-      item.id = item.id || nextId('k');
+      item.id = item.id || nextId('k', list);
       list.push(item);
       store.setMerchantKnowledge(merchantId, list);
       return item;
@@ -366,9 +432,12 @@
       var list = store.getMerchantKnowledge(merchantId).slice();
       var added = [];
       items.forEach(function (item) {
-        item.id = item.id || nextId('k');
-        list.push(item);
-        added.push(item);
+        // 复制一份再入库，避免与导入预览中的对象共用引用
+        var newItem = Object.assign({}, item, { similarQs: (item.similarQs || []).slice() });
+        // 逐条生成独立编号；list 同时包含已有知识和本批刚生成的条目，杜绝同号
+        newItem.id = newItem.id || nextId('k', list);
+        list.push(newItem);
+        added.push(newItem);
       });
       store.setMerchantKnowledge(merchantId, list);
       return added;
@@ -419,7 +488,7 @@
     },
     addMerchantSetKnowledge: function (setId, item) {
       var list = store.getMerchantSetKnowledge(setId).slice();
-      item.id = item.id || nextId('k');
+      item.id = item.id || nextId('k', list);
       list.push(item);
       store.setMerchantSetKnowledge(setId, list);
       return item;
@@ -485,7 +554,7 @@
     },
     addIndustryKnowledge: function (industryId, item) {
       var list = store.getIndustryKnowledge(industryId).slice();
-      item.id = item.id || nextId('k');
+      item.id = item.id || nextId('k', list);
       list.push(item);
       store.setIndustryKnowledge(industryId, list);
       return item;
@@ -512,7 +581,7 @@
     },
     addGlobalKnowledge: function (item) {
       var list = store.getGlobalKnowledge().slice();
-      item.id = item.id || nextId('k');
+      item.id = item.id || nextId('k', list);
       list.push(item);
       save('globalKnowledge', list);
       return item;
